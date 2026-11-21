@@ -12,7 +12,10 @@
 #  - XML-Dateien in P:\BMP, die aelter als 15 Minuten sind, werden
 #      jede Minute nach P:\BMP\alt verschoben.
 #
-#  Start ueber "BMP-Scanner starten.bat". Fenster darf minimiert bleiben.
+#  - In der Taskleiste eigenes Symbol (Data-Matrix-Code) mit Statuspunkt:
+#      gruen = bereit, orange = wartet auf den Scanner; Status auch im Titel.
+#
+#  Start ueber NVerb (Autostart "NVerb.exe bmpscanner"). Fenster darf minimiert bleiben.
 # =====================================================================
 
 param(
@@ -29,6 +32,118 @@ $Latin1 = [System.Text.Encoding]::GetEncoding(28591)   # ISO-8859-1, Byte fuer B
 $ErsatzOrdner = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "BMP"
 
 function Log($text) { Write-Host ("{0:HH:mm:ss}  {1}" -f (Get-Date), $text) }
+
+# ------------------- Icon und Titel fuer die Taskleiste -------------------
+# Eigenes Symbol (Data-Matrix-Code wie auf dem Medikationsplan) mit Statuspunkt:
+# gruen = bereit, orange = wartet auf den Scanner. Eigene AppUserModelID, damit
+# Windows das Fenster nicht unter dem PowerShell-Symbol zusammenfasst.
+# Alles nur Anzeige: geht hier etwas schief, laeuft das Skript normal weiter.
+$script:IconOk = $false
+$script:Status = ""
+$script:Icons = @{}
+try {
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class BmpFenster {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+    [StructLayout(LayoutKind.Explicit)]
+    public struct PROPVARIANT { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr p; [FieldOffset(12)] public int p2; }
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPropertyStore {
+        int GetCount(out uint c);
+        int GetAt(uint i, out PROPERTYKEY k);
+        int GetValue(ref PROPERTYKEY k, out PROPVARIANT v);
+        int SetValue(ref PROPERTYKEY k, ref PROPVARIANT v);
+        int Commit();
+    }
+    [DllImport("shell32.dll")] static extern int SHGetPropertyStoreForWindow(IntPtr h, ref Guid riid, [Out, MarshalAs(UnmanagedType.Interface)] out IPropertyStore ps);
+    public static void SetzeAppId(IntPtr h, string id) {
+        Guid iid = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99");
+        IPropertyStore ps;
+        if (SHGetPropertyStoreForWindow(h, ref iid, out ps) != 0 || ps == null) return;
+        PROPERTYKEY k = new PROPERTYKEY();
+        k.fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); k.pid = 5; // PKEY_AppUserModel_ID
+        PROPVARIANT v = new PROPVARIANT();
+        v.vt = 31; // VT_LPWSTR
+        v.p = Marshal.StringToCoTaskMemUni(id);
+        ps.SetValue(ref k, ref v);
+        ps.Commit();
+        Marshal.FreeCoTaskMem(v.p);
+        Marshal.ReleaseComObject(ps);
+    }
+    public static void SetzeIcon(IntPtr h, IntPtr klein, IntPtr gross) {
+        SendMessage(h, 0x80, (IntPtr)0, klein);  // WM_SETICON, ICON_SMALL
+        SendMessage(h, 0x80, (IntPtr)1, gross);  // WM_SETICON, ICON_BIG
+    }
+}
+"@
+    $script:Konsole = [BmpFenster]::GetConsoleWindow()
+    if ($script:Konsole -ne [IntPtr]::Zero) {
+        [BmpFenster]::SetzeAppId($script:Konsole, "Praxis.BMP-Scanner")
+        $script:IconOk = $true
+    }
+} catch { Log "Hinweis: Symbol fuer die Taskleiste nicht moeglich ($($_.Exception.Message))" }
+
+function Erzeuge-Icon([int]$g, [System.Drawing.Color]$farbe) {
+    # Data-Matrix-Muster: durchgehende Kante links und unten, Taktmuster oben und rechts
+    $muster = @("1010101010",
+                "1001101101",
+                "1110010100",
+                "1011011011",
+                "1100110100",
+                "1011100111",
+                "1101011000",
+                "1001110111",
+                "1110100100",
+                "1111111111")
+    $n = if ($g -le 16) { 7 } else { 10 }
+    $m = [math]::Floor(($g - 2) / $n)
+    $o = [math]::Floor(($g - $n * $m) / 2)
+    $bmp = New-Object System.Drawing.Bitmap $g, $g
+    $gr = [System.Drawing.Graphics]::FromImage($bmp)
+    $gr.Clear([System.Drawing.Color]::White)
+    $dunkel = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(20, 40, 90))
+    for ($z = 0; $z -lt $n; $z++) {
+        # beim kleinen Muster die letzte Zeile (durchgehende Kante) behalten
+        $zeile = if ($z -eq $n - 1) { $muster[9] } else { $muster[$z] }
+        for ($s = 0; $s -lt $n; $s++) {
+            $an = ($s -eq 0) -or ($zeile[$s] -eq [char]'1')
+            if ($s -eq $n - 1 -and $z -lt $n - 1) { $an = ($z % 2 -eq 1) }   # Taktmuster rechts
+            if ($z -eq 0) { $an = ($s % 2 -eq 0) }                           # Taktmuster oben
+            if ($an) { $gr.FillRectangle($dunkel, $o + $s * $m, $o + $z * $m, $m, $m) }
+        }
+    }
+    # Statuspunkt unten rechts mit weissem Rand
+    $d = [math]::Round($g * 0.5)
+    $gr.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $gr.FillEllipse([System.Drawing.Brushes]::White, $g - $d - 1, $g - $d - 1, $d + 1, $d + 1)
+    $punkt = New-Object System.Drawing.SolidBrush $farbe
+    $rand = [math]::Max(1, [math]::Round($g / 16))
+    $gr.FillEllipse($punkt, $g - $d - 1 + $rand, $g - $d - 1 + $rand, $d + 1 - 2 * $rand, $d + 1 - 2 * $rand)
+    $gr.Dispose(); $dunkel.Dispose(); $punkt.Dispose()
+    return $bmp.GetHicon()
+}
+
+function Setze-Status([string]$status, [string]$text) {
+    # nur bei Aenderung, die Hauptschleife ruft das oft auf
+    if ($status -eq $script:Status) { return }
+    $script:Status = $status
+    try { $Host.UI.RawUI.WindowTitle = "BMP-Scanner (nicht schliessen) - $text" } catch {}
+    if (-not $script:IconOk) { return }
+    try {
+        if (-not $script:Icons.ContainsKey($status)) {
+            $farbe = if ($status -eq "bereit") { [System.Drawing.Color]::FromArgb(30, 160, 60) }
+                     else { [System.Drawing.Color]::FromArgb(235, 140, 0) }
+            $script:Icons[$status] = @((Erzeuge-Icon 16 $farbe), (Erzeuge-Icon 32 $farbe))
+        }
+        [BmpFenster]::SetzeIcon($script:Konsole, $script:Icons[$status][0], $script:Icons[$status][1])
+    } catch {}
+}
 
 function Finde-ScannerPort {
     if ($Port -ne "") { return $Port }
@@ -154,13 +269,14 @@ Log "BMP-Scanner gestartet. Zielordner: $Ordner"
 while ($true) {
     $com = Finde-ScannerPort
     Aufraeumen
-    if (-not $com) { Log "Kein Honeywell-Scanner im COM-Modus gefunden - neuer Versuch in 5 s ..."; Start-Sleep 5; continue }
+    if (-not $com) { Setze-Status "warte" "wartet auf Scanner"; Log "Kein Honeywell-Scanner im COM-Modus gefunden - neuer Versuch in 5 s ..."; Start-Sleep 5; continue }
 
     $sp = New-Object System.IO.Ports.SerialPort $com, 115200, ([System.IO.Ports.Parity]::None), 8, ([System.IO.Ports.StopBits]::One)
     $sp.Encoding = $Latin1
     $sp.DtrEnable = $true; $sp.RtsEnable = $true
     try {
         $sp.Open()
+        Setze-Status "bereit" "bereit an $com"
         Log "Bereit an $com - Medikationsplan einfach scannen."
         $puffer = ""; $letzteDaten = Get-Date
         while ($true) {
@@ -180,6 +296,7 @@ while ($true) {
             Start-Sleep -Milliseconds 50
         }
     } catch {
+        Setze-Status "warte" "Verbindung zu $com unterbrochen"
         Log "Verbindung zu $com unterbrochen ($($_.Exception.Message)) - neuer Versuch in 5 s ..."
         Start-Sleep 5
     } finally {
