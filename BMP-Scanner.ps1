@@ -5,7 +5,9 @@
 #  - Medikationsplan (BMP, Text beginnt mit <MP ...):
 #      wird als XML-Datei gespeichert, z. B.
 #      P:\BMP\Schade_Gerald_17.12.1962_2026-11-21_15-40-12.xml
-#      und zusaetzlich in die Zwischenablage gelegt.
+#      und zusaetzlich in die Zwischenablage gelegt. Ist P: nicht verbunden,
+#      ueber \\linux1\daten\Patientendokumente\BMP (derselbe Ordner),
+#      erst wenn beides scheitert in Dokumente\BMP.
 #  - Alle anderen (kurzen) Barcodes, z. B. PZN auf Packungen:
 #      werden wie bisher in das aktive Fenster "getippt".
 #
@@ -21,6 +23,7 @@
 param(
     [string]$Port      = "",          # leer = Honeywell-Scanner automatisch suchen
     [string]$Ordner    = "P:\BMP",    # Zielordner fuer die XML-Dateien
+    [string]$Netzordner = "\\linux1\daten\Patientendokumente\BMP", # derselbe Ordner ohne Laufwerksbuchstaben, falls P: (noch) nicht verbunden ist
     [bool]  $KurzcodesTippen = $true, # andere Barcodes ins aktive Fenster tippen
     [bool]  $EnterNachKurzcode = $true, # danach Enter senden (wie vorher im Tastaturmodus)
     [int]   $AltNachMinuten = 15       # XML-Dateien in $Ordner, die aelter sind, nach $Ordner\alt verschieben
@@ -191,17 +194,23 @@ function Speichere-BMP([string]$xml) {
     if ($geb -ne "")     { $teile += $geb }
     $name = ($teile -join "_") + $blattTeil + "_" + (Get-Date -Format "yyyy-MM-dd_HH-mm-ss") + ".xml"
 
-    $ziel = $Ordner
-    try {
-        if (-not (Test-Path $ziel)) { New-Item -ItemType Directory -Path $ziel -Force | Out-Null }
-        $datei = Join-Path $ziel $name
-        [System.IO.File]::WriteAllBytes($datei, $Latin1.GetBytes($xml))
-    } catch {
-        # z. B. Laufwerk P: gerade nicht erreichbar -> lokal speichern
+    # erst P:\BMP, dann derselbe Ordner ueber \\linux1 (P: evtl. nicht verbunden), zuletzt lokal
+    $datei = $null
+    foreach ($ziel in @($Ordner, $Netzordner)) {
+        if ($datei -or [string]::IsNullOrEmpty($ziel)) { continue }
+        try {
+            if (-not (Test-Path $ziel)) { New-Item -ItemType Directory -Path $ziel -Force | Out-Null }
+            $d = Join-Path $ziel $name
+            [System.IO.File]::WriteAllBytes($d, $Latin1.GetBytes($xml))
+            $datei = $d
+            if ($ziel -ne $Ordner) { Log "Hinweis: $Ordner nicht erreichbar, ueber $ziel gespeichert." }
+        } catch {}
+    }
+    if (-not $datei) {
         if (-not (Test-Path $ErsatzOrdner)) { New-Item -ItemType Directory -Path $ErsatzOrdner -Force | Out-Null }
         $datei = Join-Path $ErsatzOrdner $name
         [System.IO.File]::WriteAllBytes($datei, $Latin1.GetBytes($xml))
-        Log "ACHTUNG: $Ordner nicht erreichbar, lokal gespeichert!"
+        Log "ACHTUNG: $Ordner und $Netzordner nicht erreichbar, lokal gespeichert!"
         [console]::Beep(400, 600)
     }
     try { Set-Clipboard -Value $xml } catch {}
@@ -214,12 +223,14 @@ function Aufraeumen {
     if (((Get-Date) - $script:letztesAufraeumen).TotalSeconds -lt 60) { return }
     $script:letztesAufraeumen = Get-Date
     try {
-        if (-not (Test-Path $Ordner)) { return }
+        # P:\BMP, sonst derselbe Ordner ueber \\linux1
+        $basis = @($Ordner, $Netzordner) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+        if (-not $basis) { return }
         $grenze = (Get-Date).AddMinutes(-$AltNachMinuten)
-        $alte = Get-ChildItem -Path $Ordner -Filter *.xml -File -ErrorAction SilentlyContinue |
+        $alte = Get-ChildItem -Path $basis -Filter *.xml -File -ErrorAction SilentlyContinue |
                 Where-Object { $_.LastWriteTime -lt $grenze }
         if (-not $alte) { return }
-        $altOrdner = Join-Path $Ordner "alt"
+        $altOrdner = Join-Path $basis "alt"
         if (-not (Test-Path $altOrdner)) { New-Item -ItemType Directory -Path $altOrdner -Force | Out-Null }
         foreach ($f in $alte) {
             # laeuft auf mehreren PCs gleichzeitig: Fehler (Datei schon verschoben) einfach ignorieren
@@ -264,7 +275,7 @@ function Verarbeite([string]$daten) {
 $Host.UI.RawUI.WindowTitle = "BMP-Scanner (nicht schliessen)"
 $script:letzterPlan = ""; $script:letzterPlanZeit = Get-Date "2000-01-01"
 $script:letztesAufraeumen = Get-Date "2000-01-01"
-Log "BMP-Scanner gestartet. Zielordner: $Ordner"
+Log "BMP-Scanner gestartet. Zielordner: $Ordner (sonst $Netzordner)"
 
 while ($true) {
     $com = Finde-ScannerPort
