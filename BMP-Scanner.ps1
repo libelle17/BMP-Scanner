@@ -12,7 +12,8 @@
 #      werden wie bisher in das aktive Fenster "getippt".
 #
 #  - XML-Dateien in P:\BMP, die aelter als 15 Minuten sind, werden
-#      jede Minute nach P:\BMP\alt verschoben.
+#      jede Minute nach P:\BMP\alt verschoben. Eine von Hand aus alt
+#      zurueckgeholte Datei bekommt wieder 15 Minuten (Aenderungsdatum = jetzt).
 #
 #  - In der Taskleiste eigenes Symbol (Data-Matrix-Code) mit Statuspunkt:
 #      gruen = bereit, orange = wartet auf den Scanner; Status auch im Titel.
@@ -227,16 +228,25 @@ function Aufraeumen {
         $basis = @($Ordner, $Netzordner) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
         if (-not $basis) { return }
         $grenze = (Get-Date).AddMinutes(-$AltNachMinuten)
-        $alte = Get-ChildItem -Path $basis -Filter *.xml -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -lt $grenze }
-        if (-not $alte) { return }
+        $dateien = @(Get-ChildItem -Path $basis -Filter *.xml -File -ErrorAction SilentlyContinue)
+        $alte = @($dateien | Where-Object { $_.LastWriteTime -lt $grenze })
         $altOrdner = Join-Path $basis "alt"
-        if (-not (Test-Path $altOrdner)) { New-Item -ItemType Directory -Path $altOrdner -Force | Out-Null }
         foreach ($f in $alte) {
+            if ($null -ne $script:bekannt -and -not $script:bekannt.Contains($f.Name)) {
+                # neu aufgetaucht, aber schon alt: von Hand aus alt zurueckgeholt. Aenderungsdatum auf
+                # jetzt setzen, damit sie wieder 15 Minuten in P:\BMP bleibt (und als frisch gilt)
+                try { $f.LastWriteTime = Get-Date; Log "Aus alt zurueckgeholt, bleibt $AltNachMinuten Minuten: $($f.Name)" } catch {}
+                continue
+            }
+            if (-not (Test-Path $altOrdner)) { New-Item -ItemType Directory -Path $altOrdner -Force | Out-Null }
             # laeuft auf mehreren PCs gleichzeitig: Fehler (Datei schon verschoben) einfach ignorieren
             try { Move-Item -LiteralPath $f.FullName -Destination $altOrdner -Force -ErrorAction Stop
                   Log "Nach alt verschoben: $($f.Name)" } catch {}
         }
+        # Dateinamen merken, die jetzt in P:\BMP liegen; beim ersten Durchlauf nach dem Start ist
+        # $script:bekannt noch leer, dann werden alte Dateien ganz normal verschoben
+        $script:bekannt = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($f in @(Get-ChildItem -Path $basis -Filter *.xml -File -ErrorAction SilentlyContinue)) { [void]$script:bekannt.Add($f.Name) }
     } catch {}
 }
 
@@ -275,6 +285,7 @@ function Verarbeite([string]$daten) {
 $Host.UI.RawUI.WindowTitle = "BMP-Scanner (nicht schliessen)"
 $script:letzterPlan = ""; $script:letzterPlanZeit = Get-Date "2000-01-01"
 $script:letztesAufraeumen = Get-Date "2000-01-01"
+$script:bekannt = $null   # Dateinamen in P:\BMP beim letzten Aufraeumen (erkennt aus alt zurueckgeholte Dateien)
 Log "BMP-Scanner gestartet. Zielordner: $Ordner (sonst $Netzordner)"
 
 while ($true) {
